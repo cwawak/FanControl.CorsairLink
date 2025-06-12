@@ -12,9 +12,11 @@ import struct
 VENDOR_ID = 0x1B1C
 PRODUCT_ID = 0x0C3F
 # Per the protocol, HID packets are 512 bytes plus a report ID byte.
-# python-hid automatically prepends the report ID when sending so we
-# allocate 512 bytes for reads and writes here.
-PACKET_SIZE = 512
+# The python-hid library does not automatically prepend the report ID,
+# so output reports must be 513 bytes long while input reports remain
+# 512 bytes.
+PACKET_SIZE_IN = 512
+PACKET_SIZE_OUT = PACKET_SIZE_IN + 1
 
 # --- PROTOCOL CONSTANTS (from FanControl.CorsairLink) ---
 CMD_HEADER = bytes([0x00, 0x00, 0x01])
@@ -42,15 +44,15 @@ READ_TIMEOUT_SEC = 0.5
 
 def create_command_packet(command: bytes, data: bytes = bytes()) -> bytes:
     """Wraps a command and data in the required header."""
-    packet = bytearray(PACKET_SIZE)
+    packet = bytearray(PACKET_SIZE_OUT)
     full = CMD_HEADER + command + data
     packet[: len(full)] = full
     return bytes(packet)
 
 
-def read_packet(device: hid.Device) -> bytes | None:
+def read_packet(device: hid.Device, timeout: float = READ_TIMEOUT_SEC) -> bytes | None:
     """Reads a single packet from the device."""
-    data = device.read(PACKET_SIZE)
+    data = device.read(PACKET_SIZE_IN, int(timeout * 1000))
     return bytes(data) if data else None
 
 
@@ -65,18 +67,19 @@ def send_command(device: hid.Device, command: bytes, data: bytes = bytes(), wait
     if response[ERROR_CODE_INDEX] != 0:
         return None
 
-    if wait_for_type is None:
-        return response
+    if wait_for_type is not None:
+        end = time.monotonic() + READ_TIMEOUT_SEC
+        while response[DATA_TYPE_START_INDEX:DATA_TYPE_START_INDEX + 2] != wait_for_type:
+            if time.monotonic() >= end:
+                return None
+            next_resp = read_packet(device, end - time.monotonic())
+            if not next_resp:
+                return None
+            if next_resp[ERROR_CODE_INDEX] != 0:
+                return None
+            response = next_resp
 
-    if response[DATA_TYPE_START_INDEX:DATA_TYPE_START_INDEX + 2] == wait_for_type:
-        return response
-
-    start = time.monotonic()
-    while time.monotonic() - start < READ_TIMEOUT_SEC:
-        resp = read_packet(device)
-        if resp and resp[ERROR_CODE_INDEX] == 0 and resp[DATA_TYPE_START_INDEX:DATA_TYPE_START_INDEX + 2] == wait_for_type:
-            return resp
-    return None
+    return response
 
 
 def parse_sensors(packet: bytes | None, is_temp: bool = False) -> list:
@@ -111,7 +114,7 @@ def main() -> None:
         print(f"Opening device at {path.decode('utf-8')}")
         device = hid.device()
         device.open_path(path)
-        device.set_nonblocking(1)
+        device.set_nonblocking(0)
 
         print("Entering software mode...")
         send_command(device, CMD_ENTER_SOFTWARE_MODE)
